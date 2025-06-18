@@ -1,68 +1,114 @@
+// main.go
 package main
 
 import (
-	"fmt"           // Formatting strings
-	"io/ioutil"     // Reading/writing files and directories
-	"log"           // Logging errors and fatal messages
-	"os"            // OS functions (e.g., checking root privileges)
-	"os/exec"       // Executing shell commands
-	"path/filepath" // Constructing file paths
-	"strings"       // String manipulation
+	"fmt"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
-// netplanDir: Directory where netplan YAML files are stored
-// backupSuffix: Suffix added to make backup copies
-// configFile: Name of the new netplan configuration file
+// デフォルト設定（簡易モード時に使用）
 const (
-	netplanDir   = "/etc/netplan"
-	backupSuffix = ".bak"
-	configFile   = "01-static-network.yaml"
+	defaultGateway = "192.168.3.1"
+	defaultCIDR    = "24" // ネットマスク255.255.255.0相当
+	defaultDNS     = "8.8.8.8"
+	netplanDir     = "/etc/netplan"
+	configFilename = "01-static-network.yaml"
+	backupSuffix   = ".bak"
 )
 
-// checkRoot ensures the program is run with root privileges
-func checkRoot() {
-	if os.Geteuid() != 0 {
-		log.Fatal("Error: This tool must be run as root.")
-	}
+func usage() {
+	fmt.Println("Usage:")
+	fmt.Println("  フルモード: sudo fixip <interface> <ip-address> <cidr> <gateway> [<dns1[,dns2,...]>]")
+	fmt.Println("  簡易モード: sudo fixip <interface> <ip-address>")
+	os.Exit(1)
 }
 
-// backupNetplan reads all .yaml/.yml files in netplanDir and copies
-// them with a .bak suffix if a backup does not already exist
-func backupNetplan() {
-	files, err := ioutil.ReadDir(netplanDir)
+func main() {
+	// root 権限チェック
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "root 権限で実行してください")
+		os.Exit(1)
+	}
+
+	args := os.Args[1:]
+	var iface, ip, cidr, gateway, dnsList string
+
+	switch len(args) {
+	case 2:
+		// 簡易モード
+		iface = args[0]
+		ip = args[1]
+		cidr = defaultCIDR
+		gateway = defaultGateway
+		dnsList = defaultDNS
+
+	case 4, 5:
+		// フルモード
+		iface = args[0]
+		ip = args[1]
+		cidr = args[2]
+		gateway = args[3]
+		if len(args) == 5 && args[4] != "" {
+			dnsList = args[4]
+		} else {
+			dnsList = defaultDNS
+		}
+
+	default:
+		usage()
+	}
+
+	// netplan ディレクトリ内の既存 YAML をバックアップ
+	backupNetplanFiles()
+
+	// 新設定ファイルの生成
+	yaml := generateNetplanYAML(iface, ip, cidr, gateway, dnsList)
+
+	// ファイル書き込み
+	path := filepath.Join(netplanDir, configFilename)
+	if err := ioutil.WriteFile(path, []byte(yaml), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "設定書き込みエラー: %v\n", err)
+		os.Exit(1)
+	}
+
+	// netplan apply 実行
+	if err := runCommand("netplan", "apply"); err != nil {
+		fmt.Fprintf(os.Stderr, "netplan apply エラー: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ %s に %s/%s を設定しました (GW: %s, DNS: %s)\n",
+		iface, ip, cidr, gateway, dnsList)
+}
+
+// backupNetplanFiles は /etc/netplan/*.yaml を .bak としてバックアップします
+func backupNetplanFiles() {
+	files, err := filepath.Glob(filepath.Join(netplanDir, "*.yaml"))
 	if err != nil {
-		log.Fatalf("Failed to read netplan dir: %v", err)
+		fmt.Fprintf(os.Stderr, "バックアップファイル探索エラー: %v\n", err)
+		os.Exit(1)
 	}
 	for _, f := range files {
-		ext := filepath.Ext(f.Name())
-		if ext == ".yaml" || ext == ".yml" {
-			src := filepath.Join(netplanDir, f.Name())
-			dst := src + backupSuffix
-			if _, err := os.Stat(dst); os.IsNotExist(err) {
-				// Copy original file to backup
-				if err := exec.Command("cp", src, dst).Run(); err != nil {
-					log.Fatalf("Backup failed: %v", err)
-				}
+		bak := f + backupSuffix
+		if _, err := os.Stat(bak); os.IsNotExist(err) {
+			if err := copyFile(f, bak); err != nil {
+				fmt.Fprintf(os.Stderr, "バックアップエラー (%s): %v\n", f, err)
+				os.Exit(1)
 			}
 		}
 	}
 }
 
-// writeConfig generates a new netplan YAML file with the given parameters:
-// iface: network interface (e.g., eth0)
-// address: IP address (e.g., 192.168.3.51)
-// cidr: subnet prefix length (e.g., 24)
-// gateway: default gateway IP
-// dns: list of DNS server IPs
-func writeConfig(iface, address, cidr, gateway string, dns []string) {
-	path := filepath.Join(netplanDir, configFile)
-	// Quote each DNS entry for YAML syntax
-	quoted := make([]string, len(dns))
-	for i, d := range dns {
-		quoted[i] = fmt.Sprintf("\"%s\"", d)
-	}
-	// Build YAML content
-	content := fmt.Sprintf(`network:
+// generateNetplanYAML は netplan 用の YAML コンテンツを組み立てます
+func generateNetplanYAML(iface, ip, cidr, gateway, dnsList string) string {
+	// DNS リストを ["a","b",...] の形式に変換
+	dnsEntries := `["` + strings.ReplaceAll(dnsList, ",", `","`) + `"]`
+
+	return fmt.Sprintf(`network:
   version: 2
   renderer: networkd
   ethernets:
@@ -71,44 +117,23 @@ func writeConfig(iface, address, cidr, gateway string, dns []string) {
       addresses: ["%s/%s"]
       gateway4: %s
       nameservers:
-        addresses: [%s]
-`, iface, address, cidr, gateway, strings.Join(quoted, ", "))
-	// Write to file, overwriting if exists
-	if err := ioutil.WriteFile(path, []byte(content), 0644); err != nil {
-		log.Fatalf("Failed to write config: %v", err)
-	}
+        addresses: %s
+`, iface, ip, cidr, gateway, dnsEntries)
 }
 
-// applyNetplan runs 'netplan apply' to activate the new network configuration
-func applyNetplan() {
-	if err := exec.Command("netplan", "apply").Run(); err != nil {
-		log.Fatalf("netplan apply failed: %v", err)
+// copyFile は src を dst にバイトコピーします
+func copyFile(src, dst string) error {
+	data, err := ioutil.ReadFile(src)
+	if err != nil {
+		return err
 	}
+	return ioutil.WriteFile(dst, data, 0644)
 }
 
-func main() {
-	// Ensure correct number of arguments
-	if len(os.Args) < 5 {
-		fmt.Println("Usage: sudo fixip <interface> <ip-address> <cidr> <gateway> [<dns1[,dns2,...]>]")
-		os.Exit(1)
-	}
-	iface := os.Args[1]
-	address := os.Args[2]
-	cidr := os.Args[3]
-	gateway := os.Args[4]
-	dns := []string{"8.8.8.8"} // Default DNS
-	if len(os.Args) >= 6 {
-		dns = strings.Split(os.Args[5], ",")
-	}
-
-	// 1. Check for root privileges
-	checkRoot()
-	// 2. Backup existing netplan configs
-	backupNetplan()
-	// 3. Write the static IP configuration
-	writeConfig(iface, address, cidr, gateway, dns)
-	// 4. Apply the new configuration
-	applyNetplan()
-
-	fmt.Printf("✅ Static IP set to %s/%s on %s\n", address, cidr, iface)
+// runCommand は外部コマンドを同期実行します
+func runCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
