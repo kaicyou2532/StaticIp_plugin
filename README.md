@@ -1,4 +1,6 @@
- fixip: One コマンドで netplan の静的 IP を設定する Go 製 CLI ツール
+# コマンドで netplan の静的 IP を設定する Go 製 CLI ツール
+
+## Ipアドレスをいちいちnetplanから書き換えに行くのがめんどくさすぎたため作成
 
 使い方:
    sudo fixip <インターフェース> <IP アドレス> <CIDR> <ゲートウェイ> [<DNS1[,DNS2,...]>]
