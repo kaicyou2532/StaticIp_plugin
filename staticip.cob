@@ -1,7 +1,7 @@
        * Static IP Configuration Plugin in COBOL
        IDENTIFICATION DIVISION.
        PROGRAM-ID. SetStaticIP.
-       AUTHOR. ChatGPT.
+       AUTHOR. kaicyou2532
 
        ENVIRONMENT DIVISION.
        INPUT-OUTPUT SECTION.
